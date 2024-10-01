@@ -1,0 +1,15 @@
+pandas
+numpy
+matplotlib
+pyarrow
+soundfile
+simpleaudio
+librosa
+soundfile
+tqdm
+pydub 
+transformers
+datasets
+torch
+torchvision 
+torchaudio
