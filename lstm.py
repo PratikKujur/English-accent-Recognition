@@ -1,191 +1,196 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, random_split
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import classification_report, confusion_matrix
-import numpy as np
 import os
-from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader, random_split
+import numpy as np
 import mlflow
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import LabelEncoder
+import matplotlib.pyplot as plt
+from collections import Counter
 
-# Dataset class to handle loading .npy files
+# Dataset setup
 class AccentDataset(Dataset):
     def __init__(self, data_dir, label_encoder):
         self.data_dir = data_dir
+        self.label_encoder = label_encoder
         self.files = []
         self.labels = []
-        
-        # Collect all files and their respective labels
-        for accent_folder in os.listdir(data_dir):
-            folder_path = os.path.join(data_dir, accent_folder)
-            if os.path.isdir(folder_path):
-                for file in os.listdir(folder_path):
-                    if file.endswith('.npy'):
-                        self.files.append(os.path.join(folder_path, file))
-                        self.labels.append(accent_folder)
+        for label_folder in os.listdir(data_dir):
+            label_path = os.path.join(data_dir, label_folder)
+            if os.path.isdir(label_path):
+                for file in os.listdir(label_path):
+                    if file.endswith(".npy"):
+                        self.files.append(os.path.join(label_path, file))
+                        self.labels.append(label_folder)
 
-        # Encode the labels
-        self.label_encoder = label_encoder
-        self.labels = self.label_encoder.transform(self.labels)
+        self.labels = label_encoder.transform(self.labels)
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
-        file_path = self.files[idx]
-        features = np.load(file_path)  # Load the .npy feature embedding
-        features = torch.tensor(features).float()  # Convert to tensor
-        label = torch.tensor(self.labels[idx]).long()  # Get label
-        return features, label
+        features = np.load(self.files[idx])
+        label = self.labels[idx]
+        return torch.tensor(features, dtype=torch.float32), label
 
-# LSTM Model for Accent Classification
-class LSTMModel(nn.Module):
+# Model setup
+class LSTMClassifier(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, num_classes):
-        super(LSTMModel, self).__init__()
+        super(LSTMClassifier, self).__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x):
-        # LSTM expects input of shape (batch_size, seq_len, input_dim)
-        out, _ = self.lstm(x)  # out has shape (batch_size, seq_len, hidden_dim)
-        out = out[:, -1, :]    # Taking output of the last time step
-        out = self.fc(out)      # Final layer for classification
+        _, (hn, _) = self.lstm(x)
+        out = self.fc(hn[-1])
         return out
 
-# Function to compute class weights
-def compute_class_weights(labels):
-    class_weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
-    return torch.tensor(class_weights, dtype=torch.float)
-
-# Load dataset and split into train/test
-def load_data_and_split(data_dir, label_encoder, batch_size=16, test_split=0.2):
-    dataset = AccentDataset(data_dir, label_encoder)
-    train_size = int((1 - test_split) * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    return train_loader, test_loader, dataset.labels
-
-# Training function with early stopping
-def train_model(model, train_loader, criterion, optimizer, device, patience=5):
+# Training, evaluation, and utilities
+def train(model, dataloader, criterion, optimizer, device):
     model.train()
-    train_losses = []
-    early_stop_count = 0
-    min_loss = float('inf')
+    running_loss = 0
+    all_labels, all_preds = [], []
+    for features, labels in dataloader:
+        features, labels = features.to(device), labels.to(device).long()  # Convert labels to Long tensor
+        optimizer.zero_grad()
+        outputs = model(features)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
 
-    for epoch in range(num_epochs):
-        total_loss = 0
-        all_labels = []
-        all_preds = []
-        
-        for features, labels in tqdm(train_loader):
-            features, labels = features.to(device), labels.to(device)
-            optimizer.zero_grad()
-            
-            outputs = model(features)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            
-            _, predicted = torch.max(outputs, 1)
-            all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(predicted.cpu().numpy())
+        running_loss += loss.item()
+        _, preds = torch.max(outputs, 1)
+        all_labels.extend(labels.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
 
-        avg_loss = total_loss / len(train_loader)
-        train_losses.append(avg_loss)
+    avg_loss = running_loss / len(dataloader)
+    report = classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
+    return avg_loss, report
 
-        # Early stopping check
-        if avg_loss < min_loss:
-            min_loss = avg_loss
-            torch.save(model.state_dict(), "lstm_model.pth")
-            early_stop_count = 0
-        else:
-            early_stop_count += 1
-
-        if early_stop_count >= patience:
-            print("Early stopping triggered")
-            break
-
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}")
-
-# Evaluation function with confusion matrix and metrics
-def evaluate_model(model, test_loader, criterion, device, label_encoder):
+def evaluate(model, dataloader, criterion, device):
     model.eval()
-    total_loss = 0
-    all_labels = []
-    all_preds = []
-    
+    running_loss = 0
+    all_labels, all_preds = [], []
     with torch.no_grad():
-        for features, labels in test_loader:
-            features, labels = features.to(device), labels.to(device)
+        for features, labels in dataloader:
+            features, labels = features.to(device), labels.to(device).long()  # Convert labels to Long tensor
             outputs = model(features)
             loss = criterion(outputs, labels)
-            total_loss += loss.item()
-            
-            _, predicted = torch.max(outputs, 1)
+
+            running_loss += loss.item()
+            _, preds = torch.max(outputs, 1)
             all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(predicted.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
 
-    avg_loss = total_loss / len(test_loader)
-    print(f"Test Loss: {avg_loss:.4f}")
+    avg_loss = running_loss / len(dataloader)
+    report = classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
+    return avg_loss, report
 
-    # Classification report and confusion matrix
-    print("\nClassification Report:")
-    print(classification_report(all_labels, all_preds, target_names=label_encoder.classes_))
-    print("\nConfusion Matrix:")
-    print(confusion_matrix(all_labels, all_preds))
 
-# Main script
-if __name__ == "__main__":
-    data_dir = 'Tinyembeddings'  # Path to the main folder with accents
-    num_classes = 12  # Number of accent classes
+def compute_class_weights(labels):
+    label_counts = Counter(labels)
+    total_count = sum(label_counts.values())
+    class_weights = [total_count / label_counts[i] for i in range(len(label_counts))]
+    return torch.tensor(class_weights, dtype=torch.float32)
+
+# Main training script
+def main():
+    data_dir = 'Tinyembeddings'
+    num_classes = 12  # Adjust this based on your dataset
     batch_size = 16
-    num_epochs = 20
-    patience = 5  # Early stopping patience
-
-    # Label encoding for accents
-    from sklearn.preprocessing import LabelEncoder
-    accents = sorted(os.listdir(data_dir))
-    label_encoder = LabelEncoder()
-    label_encoder.fit(accents)
-
-    # Load train/test data
-    train_loader, test_loader, labels = load_data_and_split(data_dir, label_encoder, batch_size=batch_size)
-
-    # Compute class weights for handling imbalance
-    class_weights = compute_class_weights(labels)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    class_weights = class_weights.to(device)
-
-    # Define model, loss function, optimizer
-    input_dim = 64
+    num_epochs = 10
+    patience = 5  # For early stopping
     hidden_dim = 128
     num_layers = 2
-    model = LSTMModel(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, num_classes=num_classes)
-    model.to(device)
+    input_dim = 64  # Each feature vector length
+    label_encoder = LabelEncoder()
+    label_encoder.fit(os.listdir(data_dir))
 
+    # Dataset and DataLoader setup
+    dataset = AccentDataset(data_dir, label_encoder)
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # Compute class weights and set up device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    class_weights = compute_class_weights(dataset.labels).to(device)
+
+    # Model, Loss, Optimizer, Early Stopping
+    model = LSTMClassifier(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, num_classes=num_classes)
+    model.to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
+    early_stop_counter = 0
+    best_val_loss = float("inf")
+    
+    # Metrics for loss comparison
+    train_losses, val_losses = [], []
 
-    # Track training with MLflow
+    # Logging with MLflow
     mlflow.start_run()
-    mlflow.log_param("model", "LSTM")
-    mlflow.log_param("hidden_dim", hidden_dim)
-    mlflow.log_param("num_layers", num_layers)
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch + 1}/{num_epochs}")
+        train_loss, train_report = train(model, train_loader, criterion, optimizer, device)
+        val_loss, val_report = evaluate(model, val_loader, criterion, device)
+        
+        # Log metrics
+        mlflow.log_metrics({
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_accuracy": train_report["accuracy"],
+            "val_accuracy": val_report["accuracy"]
+        }, step=epoch)
 
-    # Train the model with early stopping
-    train_model(model, train_loader, criterion, optimizer, device, patience)
+        # Early stopping logic
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            early_stop_counter = 0
+            torch.save(model.state_dict(), "best_lstm_model.pth")
+        else:
+            early_stop_counter += 1
+            if early_stop_counter >= patience:
+                print("Early stopping triggered.")
+                break
 
-    # Load the best model for evaluation
-    model.load_state_dict(torch.load("lstm_model.pth"))
+        # Track loss for comparison
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
 
-    # Evaluate the model on test set
-    evaluate_model(model, test_loader, criterion, device, label_encoder)
+        print(f"Training Loss: {train_loss:.4f} | Validation Loss: {val_loss:.4f}")
+        print("Train Classification Report:", train_report)
+        print("Validation Classification Report:", val_report)
 
-    # End MLflow tracking
     mlflow.end_run()
+
+    # Confusion matrix on validation set
+    all_labels, all_preds = [], []
+    model.eval()
+    with torch.no_grad():
+        for features, labels in val_loader:
+            features, labels = features.to(device), labels.to(device)
+            outputs = model(features)
+            _, preds = torch.max(outputs, 1)
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+
+    cm = confusion_matrix(all_labels, all_preds)
+    print("Confusion Matrix:\n", cm)
+
+    # Plot train vs validation loss
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label="Train Loss")
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label="Validation Loss")
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.title("Train vs Validation Loss")
+    plt.legend()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
